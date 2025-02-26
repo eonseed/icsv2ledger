@@ -23,6 +23,7 @@ from datetime import datetime
 from operator import attrgetter
 from locale   import atof
 from typing import AnyStr, Pattern, Optional
+from thefuzz import process, fuzz  # Import thefuzz
 
 
 class FileType(object):
@@ -113,7 +114,9 @@ DEFAULTS = dotdict({
     'ledger_decimal_comma': False,
     'skip_older_than': str(-1),
     'prompt_add_mappings': False,
-    'entry_review': False})
+    'entry_review': False,
+    'fuzzy_threshold': str(80)  # Add a fuzzy matching threshold
+    })
 
 FILE_DEFAULTS = dotdict({
     'config_file': [
@@ -434,6 +437,15 @@ def parse_args_and_config_file():
         help=('displays transaction summary and request confirmation before committing to ledger'
               ' (default: {0})'.format(DEFAULTS.entry_review)))
 
+    parser.add_argument(
+        '--fuzzy-threshold',
+        metavar='INT',
+        type=int,
+        help=('Minimum score to be considered a fuzzy match (0-100)'
+              ' (default: {0})'.format(DEFAULTS.fuzzy_threshold)))
+
+
+
     args = parser.parse_args(remaining_argv)
 
     args.ledger_file = find_first_file(
@@ -527,7 +539,7 @@ class Entry:
 
 
         desc = []
-        for index in re.compile(',\s*').split(options.desc):
+        for index in re.compile(r',\s*').split(options.desc):
             desc.append(fields[int(index) - 1].strip())
         self.desc = ' '.join(desc).strip()
 
@@ -718,7 +730,7 @@ def from_ledger(ledger_file, ledger_binary_file, command):
         raise FileNotFoundError('The system can\'t find the following ledger binary: {0}'.format(ledger))
 
 
-def read_mapping_file(map_file) -> [MappingInfo]:
+def read_mapping_file(map_file, fuzzy_threshold) -> [MappingInfo]:
     """
     Mappings are simply a CSV file with three columns.
     The first is a string to be matched against an entry description.
@@ -727,6 +739,8 @@ def read_mapping_file(map_file) -> [MappingInfo]:
 
     If the match string begins and ends with '/' it is taken to be a
     regular expression.
+
+    This version adds fuzzy matching.
     """
     mappings = []
     with open(map_file, "r", encoding='utf-8', newline='') as f:
@@ -748,6 +762,10 @@ def read_mapping_file(map_file) -> [MappingInfo]:
                               .format(pattern, map_file, e),
                               file=sys.stderr)
                         sys.exit(1)
+                elif fuzzy_threshold > 0:  # Fuzzy match (if not a regex)
+                    # We store the pattern as is, but will use it for fuzzy matching later.
+                    pass # No pre-compilation needed
+
                 mappings.append(MappingInfo(pattern, payee, account, tags, transfer_to, transfer_to_file))
     return mappings
 
@@ -779,28 +797,34 @@ def append_mapping_file(map_file, desc, payee, account, tags):
             writer = csv.writer(f)
             writer.writerow([desc, payee, account] + tags)
 
-
 def tagify(value):
     if value.find(':') < 0 and value[0] != '[' and value[-1] != ']':
         value = ":{0}:".format(value)
     return value
 
-
 def prompt_for_tags(prompt, values, default):
     tags = list(default)
     value = prompt_for_value(prompt, values, ", ".join(tags))
+
     while value:
+        value = value.strip()  # Remove leading/trailing whitespace
+        if not value:  # Handle empty input after stripping
+            break
+
         if value[0] == '-':
-            value = tagify(value[1:])
-            if value in tags:
-                tags.remove(value)
+            tag_to_remove = tagify(value[1:].strip())  # Strip whitespace
+            if tag_to_remove in tags:
+                tags.remove(tag_to_remove)
+            else:
+                print(f"Tag '{tag_to_remove}' not found. Ignoring removal.")
         else:
-            value = tagify(value)
-            if not value in tags:
-                tags.append(value)
+            new_tag = tagify(value.strip())  # Strip whitespace
+            if new_tag not in tags:
+                tags.append(new_tag)
+            else:
+                print(f"Tag '{new_tag}' already exists. Ignoring addition.")
         value = prompt_for_value(prompt, values, ", ".join(tags))
     return tags
-
 
 def prompt_for_value(prompt, values, default):
 
@@ -861,7 +885,7 @@ def main(options):
     # Read mappings
     mappings = []
     if options.mapping_file:
-        mappings = read_mapping_file(options.mapping_file)
+        mappings = read_mapping_file(options.mapping_file, options.fuzzy_threshold)
 
     if options.accounts_file:
         possible_accounts.update(read_accounts_file(options.accounts_file))
@@ -879,26 +903,37 @@ def main(options):
         transfer_to = None
         transfer_to_file = None
         found = False
-        # Try to match entry desc with mappings patterns
-        for m in mappings:
-            pattern = m.pattern
-            if isinstance(pattern, str):
-                if entry.desc == pattern:
-                    payee, account, tags = m.payee, m.account, m.tags
-                    transfer_to, transfer_to_file = m.transfer_to, m.transfer_to_file
-                    found = True  # do not break here, later mapping must win
-            else:
-                # If the pattern isn't a string it's a regex
-                match = m.pattern.match(entry.desc)
-                if match:
-                #if m[0].match(entry.desc):
-                    payee = m.payee
-                    # perform regexp substitution if captures were used
-                    if match.groups():
-                        payee = m.pattern.sub(m.payee, entry.desc)
-                    account, tags = m.account, m.tags
-                    transfer_to, transfer_to_file = m.transfer_to, m.transfer_to_file
-                    found = True
+
+        # FUZZY MATCHING LOGIC
+        if options.fuzzy_threshold > 0:
+            best_match_score = 0
+            best_match = None
+
+            for m in mappings:
+                if isinstance(m.pattern, str):  # Only fuzzy match strings
+                    score = fuzz.ratio(entry.desc.lower(), m.pattern.lower())
+                    if score >= options.fuzzy_threshold and score > best_match_score:
+                        best_match_score = score
+                        best_match = m
+                        found = True
+                elif m.pattern.match(entry.desc): # still try regex matches
+                        payee = m.payee
+                        # perform regexp substitution if captures were used
+                        match = m.pattern.match(entry.desc)
+                        if match.groups():
+                            payee = m.pattern.sub(m.payee, entry.desc)
+                        account, tags = m.account, m.tags
+                        transfer_to, transfer_to_file = m.transfer_to, m.transfer_to_file
+                        found = True
+
+
+            if best_match:  # Use the best fuzzy match if above threshold
+                payee = best_match.payee
+                account = best_match.account
+                tags = best_match.tags
+                transfer_to = best_match.transfer_to
+                transfer_to_file = best_match.transfer_to_file
+
 
         modified = False
         if options.quiet and found:
