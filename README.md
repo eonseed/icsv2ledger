@@ -437,3 +437,7 @@ On Windows the default Python installation does not provide a readline library. 
 *   [Ledger](http://ledger-cli.org)
 *   [hledger](http://hledger.org/)
 *   [thefuzz](https://github.com/seatgeek/thefuzz)
+
+## License
+
+This project is licensed under the GNU Lesser General Public License v3.0. See the LICENSE file for more details.
